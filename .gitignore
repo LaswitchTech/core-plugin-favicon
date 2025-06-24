@@ -1,0 +1,36 @@
+# Composer
+composer.phar
+*composer.phar
+.composer/
+/vendor/
+
+# Mac OS X
+.DS_Store
+*.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Git
+.git
+TOKEN
+
+# Filetypes
+*.cfg
+*.log
+
+# Exclude Files
+!info.cfg
+!routes.cfg
+!styles.cfg
+!listing.cfg
+
+# Exclude Locales Configurations and Translations
+!Locale/*/*.cfg
+
+# Unique Directories
+/tmp/
+
+# Custom Module Files
+/Definition/
