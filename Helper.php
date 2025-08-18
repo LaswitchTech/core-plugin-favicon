@@ -5,21 +5,6 @@ use \LaswitchTech\Core\Abstracts\Helper;
 
 class FaviconHelper extends Helper {
 
-    // Properties
-    private $Path;
-
-    /**
-     * Constructor
-     */
-    public function __construct()
-    {
-        // Import Global Variables
-        global $CONFIG;
-
-        // Set Properties
-        $this->Path = $CONFIG->root() . DIRECTORY_SEPARATOR . 'data';
-    }
-
     /**
      * Retrieve the Favicon URL
      */
