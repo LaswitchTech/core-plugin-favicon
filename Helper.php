@@ -24,132 +24,350 @@ class FaviconHelper extends Helper {
      */
     public function content(string $url): string
     {
-        // Retrieve the file content
-        $content = file_get_contents($this->url($url));
-
-        // Return the file content
-        return $content;
+        $ctx = stream_context_create([
+            'http' => [
+                'timeout' => 5,
+                'header'  => "User-Agent: FavHelper/1.0\r\n",
+            ]
+        ]);
+        $data = @file_get_contents($this->url($url), false, $ctx);
+        if ($data === false || $data === '') {
+            return '';
+        }
+        return $data;
     }
 
     /**
      * Detect MIME type from a binary string (blob)
      *
-     * @param string $blob  Raw file contents
+     * @param string $bytes  Raw file contents
      * @return string       Detected MIME type, e.g. "image/png"
      * @throws RuntimeException if Fileinfo isn’t available
      */
-    public function mimeType(string $blob): string
+    public function mimeType(string $bytes): string
     {
-        if (!extension_loaded('fileinfo')) {
-            throw new RuntimeException('The Fileinfo extension is not enabled.');
+        if (function_exists('finfo_buffer')) {
+            $fi = new \finfo(FILEINFO_MIME_TYPE);
+            $mime = $fi->buffer($bytes);
+            if ($mime) { return $mime; }
         }
 
-        // Open a Fileinfo resource that returns only the MIME type
-        $finfo = finfo_open(FILEINFO_MIME_TYPE);
-
-        if ($finfo === false) {
-            throw new RuntimeException('Unable to open finfo.');
+        // Minimal magic detection for ICO and PNG fallbacks.
+        // ICO header starts with 00 00 01 00
+        if (substr($bytes, 0, 4) === "\x00\x00\x01\x00") {
+            return 'image/x-icon';
         }
-
-        $mime = finfo_buffer($finfo, $blob);
-
-        finfo_close($finfo);
-
-        return $mime ?: 'application/octet-stream';
+        // PNG header 89 50 4E 47 0D 0A 1A 0A
+        if (substr($bytes, 0, 8) === "\x89PNG\x0D\x0A\x1A\x0A") {
+            return 'image/png';
+        }
+        return 'application/octet-stream';
     }
 
     /**
-     * Convert an image to a different format and size
+     * Convert an image to a different format and size (center fit).
      *
-     * @param array $logo    ['type' => mime‑type, 'content' => raw‑bytes|data‑uri]
-     * @param string $format The desired format (e.g., 'png', 'jpeg', 'gif')
-     * @param int $width     The desired width of the image
-     * @param int $height    The desired height of the image
-     * @return array        An array containing the converted image type and content
+     * - Supports input as raw bytes or data URI in $logo['content'].
+     * - $logo['type'] should be a MIME type if you have it; otherwise it's auto-detected.
+     * - Resizes to fit INSIDE $width x $height keeping aspect ratio, then pads
+     *   to exact size with transparent background (PNG/WebP/GIF) or white (JPEG/BMP).
+     * - Uses Imagick when available; falls back to GD.
+     *
+     * @param array  $logo    ['type' => 'image/png'|..., 'content' => raw-bytes|string data:uri]
+     * @param string $format  'png'|'jpeg'|'gif'|'webp'|'bmp'
+     * @param int    $width
+     * @param int    $height
+     * @return array ['type' => mime-type, 'content' => raw-bytes]
+     * @throws Exception on invalid inputs or unsupported cases.
      */
     public function convert(array $logo, string $format, int $width, int $height): array
     {
-        // 1) normalise the source bytes  ────────────────────────────────────────
-        $bytes = preg_match('#^data:.*?;base64,#', $logo['content'])
-            ? base64_decode(substr($logo['content'], strpos($logo['content'], ',') + 1))
-            : $logo['content'];
+        $format = strtolower($format);
+        if ($format === 'jpg') $format = 'jpeg';
 
-        // 2) if it’s ICO (or anything GD can’t read) fall back to Imagick ──────
-        $isIco = in_array($logo['type'], ['image/vnd.microsoft.icon', 'image/x-icon'], true);
+        $allowed = ['png','jpeg','gif','webp','bmp'];
+        if (!in_array($format, $allowed, true)) {
+            throw new Exception("Unsupported target format: {$format}");
+        }
+        if ($width <= 0 || $height <= 0) {
+            throw new Exception("Width and height must be positive integers.");
+        }
 
-        if ($isIco) {
+        $targetMime = [
+            'png'  => 'image/png',
+            'jpeg' => 'image/jpeg',
+            'gif'  => 'image/gif',
+            'webp' => 'image/webp',
+            'bmp'  => 'image/bmp',
+        ][$format];
+
+        $bytes   = $this->normalizeBytes($logo['content'] ?? null);
+        $srcMime = $logo['type'] ?? $this->mimeType($bytes);
+
+        // Quick guard against HTML/unknown blobs (e.g., 404 page).
+        // Reject obvious non-image blobs (e.g., HTML error pages)
+        if (
+            !$this->isIcoMime($srcMime) &&
+            !in_array(strtolower($srcMime), ['image/png','image/jpeg','image/gif','image/webp','image/bmp'], true)
+        ) {
+            throw new Exception("Unsupported or undetected source MIME: {$srcMime}");
+        }
+
+        // ---------- Prefer Imagick if it can actually decode this ----------
+        if (class_exists(\Imagick::class)) {
+            $img = new \Imagick();
+            $tmpPath = null; // ensure we can clean up
             try {
-                if (!extension_loaded('imagick')) {
-                    throw new RuntimeException('Imagick is required to convert .ico files.');
+                // First try blob with a filename hint (works most of the time)
+                $hint = $this->isIcoMime($srcMime) ? 'favicon.ico' : ('x.' . ($this->extFromMime($srcMime) ?? 'img'));
+                $img->readImageBlob($bytes, $hint);
+            } catch (\ImagickException $e1) {
+                // Blob sniffing can still fail for ICOs; try file-based read with .ico suffix.
+                try {
+                    if ($this->isIcoMime($srcMime)) {
+                        $tmpPath = $this->writeTemp($bytes, '.ico');
+                        // Both of these normally work; extension usually suffices:
+                        // $img->readImage("ico:$tmpPath");
+                        $img->readImage($tmpPath);
+                    } else {
+                        // Non-ICO: still try a file with the right extension if available
+                        $ext = '.' . ($this->extFromMime($srcMime) ?? 'img');
+                        $tmpPath = $this->writeTemp($bytes, $ext);
+                        $img->readImage($tmpPath);
+                    }
+                } catch (\ImagickException $e2) {
+                    // Give up on Imagick; fall through to GD path
+                    $img->clear(); $img->destroy();
+                    if ($tmpPath && file_exists($tmpPath)) @unlink($tmpPath);
+                    $eMessage = strtolower($e2->getMessage());
+                    $recoverable = (
+                        str_contains($eMessage, 'no decode delegate') ||
+                        str_contains($eMessage, 'improper image header') ||
+                        str_contains($eMessage, 'insufficient image data') ||
+                        str_contains($eMessage, 'corrupt image')
+                    );
+                    if (!$recoverable) {
+                        // non-ICO/non-recoverable -> bubble up
+                        throw $e2;
+                    }
+                    // else: continue into GD fallback below
+                    $img = null;
                 }
-                if (empty(\Imagick::queryFormats("ICO"))) {
-                    throw new \Exception('Unsupported format');
+            }
+
+            if ($img instanceof \Imagick) {
+                try {
+                    // If it's an ICO (or multi-frame), pick the largest frame.
+                    $chosen = $this->pickLargestFrame($img);
+
+                    // Resize (fit inside box; keep aspect).
+                    $chosen->thumbnailImage($width, $height, true);
+
+                    // Compose onto exact-size canvas.
+                    $canvas = new \Imagick();
+                    if (in_array($format, ['png','webp','gif'], true)) {
+                        $canvas->newImage($width, $height, new \ImagickPixel('transparent'), $format);
+                    } else {
+                        $canvas->newImage($width, $height, new \ImagickPixel('white'), $format);
+                    }
+
+                    $x = (int) floor(($width  - $chosen->getImageWidth())  / 2);
+                    $y = (int) floor(($height - $chosen->getImageHeight()) / 2);
+                    $canvas->compositeImage($chosen, \Imagick::COMPOSITE_DEFAULT, $x, $y);
+
+                    $canvas->setImageFormat($format);
+                    if ($format === 'jpeg') {
+                        $canvas->setImageCompressionQuality(85);
+                    } elseif ($format === 'webp' && method_exists($canvas, 'setImageCompressionQuality')) {
+                        $canvas->setImageCompressionQuality(80);
+                    }
+
+                    $out = $canvas->getImageBlob();
+                    $canvas->clear(); $canvas->destroy();
+                    $chosen->clear(); $chosen->destroy();
+                    $img->clear(); $img->destroy();
+                    if ($tmpPath && file_exists($tmpPath)) @unlink($tmpPath);
+
+                    return ['type' => $targetMime, 'content' => $out];
+                } finally {
+                    if ($tmpPath && file_exists($tmpPath)) @unlink($tmpPath);
                 }
-                $im = new Imagick();
-                $im->readImageBlob($bytes, 'favicon.ico');
-                $im->setIteratorIndex($im->getNumberImages() - 1);
-                $im->setImageFormat($format);
-                if ($width > 0 && $height > 0) {
-                    $im->resizeImage($width, $height, Imagick::FILTER_LANCZOS, 1, true);
-                }
-                $converted = $im->getImageBlob();
-                $im->clear();
-                $im->destroy();
-            } catch (ImagickException $e) {
-                $png = $this->extractPNG($bytes);
-                if ($png === null) {
-                    throw new RuntimeException('ICO contains no PNG frame and Imagick could not read it');
-                }
-                $bytes = $png;
-                $isIco = false;
             }
         }
-        if (!$isIco) {
-            // 3) use GD for the common formats ──────────────────────────────────
-            $src = @imagecreatefromstring($bytes);
-            if (!$src) {
-                throw new RuntimeException('Unsupported or corrupt source image.');
-            }
 
-            $dst = ($width > 0 && $height > 0)
-                ? imagescale($src, $width, $height)
-                : $src;                    // keep original size if no resize requested
-
-            ob_start();
-            switch ($format) {
-                case 'png':  imagepng($dst);          break;
-                case 'jpeg': imagejpeg($dst, null, 90); break;
-                case 'gif':  imagegif($dst);          break;
-                default:     throw new InvalidArgumentException('Bad target format');
-            }
-            $converted = ob_get_clean();
-
-            imagedestroy($dst);
-            if ($dst !== $src) {
-                imagedestroy($src);
+        // ---------- GD fallback (with PNG-in-ICO extractor) ----------
+        if ($this->isIcoMime($srcMime)) {
+            $png = $this->extractLargestPngFromIco($bytes);
+            if ($png !== null) {
+                $bytes   = $png;
+                $srcMime = 'image/png';
+            } else {
+                throw new Exception('ICO could not be decoded (no PNG payload found, and Imagick ICO support is unavailable).');
             }
         }
 
-        return [
-            'type'    => 'image/' . $format,
-            'content' => $converted,
+        $src = @imagecreatefromstring($bytes);
+        if (!$src) {
+            throw new Exception('Failed to decode image with GD.');
+        }
+
+        $srcW = imagesx($src);
+        $srcH = imagesy($src);
+        if ($srcW <= 0 || $srcH <= 0) {
+            imagedestroy($src);
+            throw new Exception('Invalid source dimensions.');
+        }
+
+        $scale = min($width / $srcW, $height / $srcH);
+        $dstW  = max(1, (int) floor($srcW * $scale));
+        $dstH  = max(1, (int) floor($srcH * $scale));
+        $dstX  = (int) floor(($width  - $dstW) / 2);
+        $dstY  = (int) floor(($height - $dstH) / 2);
+
+        $canvas = imagecreatetruecolor($width, $height);
+
+        if (in_array($format, ['png','webp','gif'], true)) {
+            imagealphablending($canvas, false);
+            imagesavealpha($canvas, true);
+            $transparent = imagecolorallocatealpha($canvas, 0, 0, 0, 127);
+            imagefilledrectangle($canvas, 0, 0, $width, $height, $transparent);
+        } else {
+            $white = imagecolorallocate($canvas, 255, 255, 255);
+            imagefilledrectangle($canvas, 0, 0, $width, $height, $white);
+        }
+
+        imagecopyresampled($canvas, $src, $dstX, $dstY, 0, 0, $dstW, $dstH, $srcW, $srcH);
+        imagedestroy($src);
+
+        ob_start();
+        switch ($format) {
+            case 'png':  imagepng($canvas); break;
+            case 'jpeg': imagejpeg($canvas, null, 85); break;
+            case 'gif':  imagegif($canvas); break;
+            case 'webp':
+                if (!function_exists('imagewebp')) {
+                    imagedestroy($canvas); ob_end_clean();
+                    throw new Exception('GD WebP support not available.');
+                }
+                imagewebp($canvas, null, 80);
+                break;
+            case 'bmp':
+                if (!function_exists('imagebmp')) {
+                    imagedestroy($canvas); ob_end_clean();
+                    throw new Exception('GD BMP support not available.');
+                }
+                imagebmp($canvas);
+                break;
+        }
+        $out = ob_get_clean();
+        imagedestroy($canvas);
+
+        return ['type' => $targetMime, 'content' => $out];
+    }
+
+    /* ===========================
+    * Helpers
+    * ===========================
+    */
+
+    private function writeTemp(string $bytes, string $suffix = '.tmp'): string
+    {
+        $base = tempnam(sys_get_temp_dir(), 'fav_');
+        $path = $base . $suffix;
+        @unlink($base);
+        file_put_contents($path, $bytes);
+        return $path;
+    }
+
+    private function extFromMime(?string $mime): ?string
+    {
+        static $map = [
+            'image/png'  => 'png',
+            'image/jpeg' => 'jpg',
+            'image/gif'  => 'gif',
+            'image/webp' => 'webp',
+            'image/bmp'  => 'bmp',
+            'image/x-icon' => 'ico',
+            'image/vnd.microsoft.icon' => 'ico',
+            'image/ico' => 'ico',
+            // you can add more if needed
         ];
+        $mime = $mime ? strtolower($mime) : null;
+        return $mime && isset($map[$mime]) ? $map[$mime] : null;
     }
 
     /**
-     * Return the first embedded PNG frame from an ICO blob, or null if none.
+     * Extract the LARGEST embedded PNG from an ICO. Returns null if none.
      */
-    private function extractPNG(string $ico): ?string
+    private function extractLargestPngFromIco(string $icoBytes): ?string
     {
-        $sig  = "\x89PNG\r\n\x1A\n";
-        $pos  = strpos($ico, $sig);
-        if ($pos === false) {
-            return null;
+        $sig = "\x89PNG\x0D\x0A\x1A\x0A";
+        $iend = "\x00\x00\x00\x00IEND\xAE\x42\x60\x82";
+        $best = null; $bestLen = 0;
+        $pos = 0;
+        while (true) {
+            $start = strpos($icoBytes, $sig, $pos);
+            if ($start === false) break;
+            $end = strpos($icoBytes, $iend, $start);
+            if ($end === false) break;
+            $end += strlen($iend);
+            $chunk = substr($icoBytes, $start, $end - $start);
+            $len = strlen($chunk);
+            if ($len > $bestLen) { $bestLen = $len; $best = $chunk; }
+            $pos = $end;
         }
-        $iend = strpos($ico, "\x00\x00\x00\x00IEND\xAE\x42\x60\x82", $pos);
-        if ($iend === false) {
-            return null;
+        return $best;
+    }
+
+    private function normalizeBytes(?string $content): string
+    {
+        if (!is_string($content) || $content === '') {
+            throw new Exception('Logo content must be a non-empty string (raw bytes or data URI).');
         }
-        return substr($ico, $pos, ($iend + 12) - $pos);
+
+        // data:[mime];base64,....
+        if (strpos($content, 'data:') === 0) {
+            if (!preg_match('#^data:(?<mime>[^;]+);base64,(?<data>.+)$#', $content, $m)) {
+                throw new Exception('Invalid data URI.');
+            }
+            $decoded = base64_decode($m['data'], true);
+            if ($decoded === false) {
+                throw new Exception('Failed to decode data URI.');
+            }
+            return $decoded;
+        }
+
+        // Assume raw bytes.
+        return $content;
+    }
+
+    private function isIcoMime(string $mime): bool
+    {
+        $mime = strtolower($mime);
+        return $mime === 'image/x-icon' || $mime === 'image/vnd.microsoft.icon' || $mime === 'image/ico';
+    }
+
+    /**
+     * For Imagick: pick the largest frame (useful for ICO or multi-frame inputs).
+     */
+    private function pickLargestFrame(\Imagick $img): \Imagick
+    {
+        $best = null; $bestArea = -1;
+
+        // If not multi-image, clone and return.
+        if ($img->getNumberImages() <= 1) {
+            return clone $img;
+        }
+
+        foreach ($img as $frame) {
+            $w = $frame->getImageWidth();
+            $h = $frame->getImageHeight();
+            $area = $w * $h;
+            if ($area > $bestArea) {
+                $bestArea = $area;
+                $best = clone $frame;
+            }
+        }
+        return $best ?? clone $img;
     }
 }
