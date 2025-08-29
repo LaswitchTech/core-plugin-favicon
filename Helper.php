@@ -101,6 +101,11 @@ class FaviconHelper extends Helper {
             'bmp'  => 'image/bmp',
         ][$format];
 
+        // Check if the logo type and the requested format are the same
+        if (array_key_exists('type', $logo) && $logo['type'] === $targetMime) {
+            return $logo;
+        }
+
         $bytes   = $this->normalizeBytes($logo['content'] ?? null);
         $srcMime = $logo['type'] ?? $this->mimeType($bytes);
 
@@ -197,13 +202,12 @@ class FaviconHelper extends Helper {
 
         // ---------- GD fallback (with PNG-in-ICO extractor) ----------
         if ($this->isIcoMime($srcMime)) {
-            $png = $this->extractLargestPngFromIco($bytes);
-            if ($png !== null) {
-                $bytes   = $png;
-                $srcMime = 'image/png';
-            } else {
-                throw new Exception('ICO could not be decoded (no PNG payload found, and Imagick ICO support is unavailable).');
+            $png = $this->icoToPng($bytes);
+            if ($png === null) {
+                throw new Exception('ICO could not be decoded (no PNG or unsupported DIB frame).');
             }
+            $bytes   = $png;
+            $srcMime = 'image/png';
         }
 
         $src = @imagecreatefromstring($bytes);
@@ -317,6 +321,114 @@ class FaviconHelper extends Helper {
             $pos = $end;
         }
         return $best;
+    }
+
+    /**
+     * Extract the largest frame from an ICO and return it as PNG bytes.
+     * Handles:
+     *  - ICO entries stored as PNG (direct passthrough)
+     *  - ICO entries stored as DIB/BMP (24/32 bpp) with AND mask (decoded to RGBA)
+     *
+     * @return string|null PNG bytes, or null if unrecognized ICO
+     */
+    private function icoToPng(string $icoBytes): ?string
+    {
+        // Minimal ICO signature check
+        if (strlen($icoBytes) < 6 || substr($icoBytes, 0, 4) !== "\x00\x00\x01\x00") {
+            return null;
+        }
+
+        $count = unpack('v', substr($icoBytes, 4, 2))[1] ?? 0;
+        if ($count < 1) { return null; }
+
+        // Read directory entries (16 bytes each) and pick the largest by area
+        $best = null; $pos = 6;
+        for ($i = 0; $i < $count; $i++, $pos += 16) {
+            $w = ord($icoBytes[$pos + 0]); $w = ($w === 0) ? 256 : $w;
+            $h = ord($icoBytes[$pos + 1]); $h = ($h === 0) ? 256 : $h;
+            $bpp    = unpack('v', substr($icoBytes, $pos + 6, 2))[1];
+            $size   = unpack('V', substr($icoBytes, $pos + 8, 4))[1];
+            $offset = unpack('V', substr($icoBytes, $pos + 12, 4))[1];
+
+            $cand = ['w'=>$w, 'h'=>$h, 'bpp'=>$bpp, 'size'=>$size, 'off'=>$offset];
+            if ($best === null || ($w*$h) > ($best['w']*$best['h'])) { $best = $cand; }
+        }
+        if ($best === null || ($best['off'] + $best['size']) > strlen($icoBytes)) {
+            return null;
+        }
+
+        $payload = substr($icoBytes, $best['off'], $best['size']);
+
+        // Case 1: the frame itself is a PNG – we can return it directly.
+        if (strncmp($payload, "\x89PNG\x0D\x0A\x1A\x0A", 8) === 0) {
+            return $payload;
+        }
+
+        // Case 2: DIB/BMP inside ICO (common). Expect BITMAPINFOHEADER (40 bytes)
+        if (strlen($payload) < 40) { return null; }
+
+        $hdr = substr($payload, 0, 40);
+        $u = unpack(
+            'VbiSize/lbiWidth/lbiHeight/vbiPlanes/vbiBitCount/VbiCompression/VbiSizeImage/' .
+            'lbiXPelsPerMeter/lbiYPelsPerMeter/VbiClrUsed/VbiClrImportant',
+            $hdr
+        );
+
+        $w   = (int)$u['biWidth'];
+        $h   = (int)(abs($u['biHeight']) / 2);       // ICO stores height*2 (XOR + AND)
+        $bpp = (int)$u['biBitCount'];
+
+        if ($w <= 0 || $h <= 0 || !in_array($bpp, [24, 32], true)) {
+            return null; // keep it simple; 1/4/8-bpp not handled here
+        }
+
+        $rowBytes     = (int)(((($bpp * $w) + 31) >> 5) << 2);
+        $pixelBytes   = $rowBytes * $h;
+        if (40 + $pixelBytes > strlen($payload)) { return null; }
+
+        $pix          = substr($payload, 40, $pixelBytes);
+        $maskRowBytes = (int)(((($w) + 31) >> 5) << 2);
+        $maskBytes    = $maskRowBytes * $h;
+        $mask         = substr($payload, 40 + $pixelBytes, $maskBytes);
+
+        // Build RGBA with GD
+        $im = imagecreatetruecolor($w, $h);
+        imagealphablending($im, false);
+        imagesavealpha($im, true);
+
+        $bytesPerPx = $bpp / 8;
+        for ($y = 0; $y < $h; $y++) {
+            $srcY = $h - 1 - $y; // DIB is bottom-up
+            $row  = substr($pix, $srcY * $rowBytes, $w * $bytesPerPx);
+
+            for ($x = 0; $x < $w; $x++) {
+                if ($bpp === 32) {
+                    $i = $x * 4;
+                    $b = ord($row[$i    ]);
+                    $g = ord($row[$i + 1]);
+                    $r = ord($row[$i + 2]);
+                    $a = ord($row[$i + 3]); // 0..255
+                } else { // 24-bpp (no alpha)
+                    $i = $x * 3;
+                    $b = ord($row[$i    ]);
+                    $g = ord($row[$i + 1]);
+                    $r = ord($row[$i + 2]);
+                    $a = 255;
+                }
+
+                // Apply AND mask (1 = transparent)
+                $maskByte = ord($mask[$srcY * $maskRowBytes + intdiv($x, 8)] ?? "\x00");
+                $maskBit  = ($maskByte >> (7 - ($x % 8))) & 1;
+                if ($maskBit) { $a = 0; }
+
+                $gdAlpha = 127 - (int) round($a * 127 / 255);
+                $col     = imagecolorallocatealpha($im, $r, $g, $b, $gdAlpha);
+                imagesetpixel($im, $x, $y, $col);
+            }
+        }
+
+        ob_start(); imagepng($im); $png = ob_get_clean(); imagedestroy($im);
+        return $png === '' ? null : $png;
     }
 
     private function normalizeBytes(?string $content): string
